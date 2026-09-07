@@ -1,6 +1,6 @@
 import { Router } from 'express';
 
-import { db, nowIso, rows, row, uuid } from '../db.js';
+import { batch, nowIso, row, rows, run, uuid } from '../db.js';
 import { badRequest, notFound } from '../errors.js';
 import {
   attendanceRows,
@@ -22,9 +22,8 @@ export const adminRouter = Router();
  * reports and the attendance log.
  *
  * `requireAdmin` is applied once where this router is mounted, so no route here
- * repeats the check. That single gate replaces the RLS policies — the
- * difference being that the rule now lives in one readable place instead of
- * being re-evaluated per row inside the database.
+ * repeats the check. That single gate is the whole authorisation model — one
+ * readable place rather than a rule re-evaluated per row inside the database.
  */
 
 /** Query strings arrive as `undefined` or `''`; both mean "no filter". */
@@ -34,8 +33,8 @@ const str = (value) => (typeof value === 'string' ? value.trim() : '');
  * Meetings
  * ------------------------------------------------------------------------ */
 
-adminRouter.get('/meetings', (_req, res) => {
-  res.json(listAdminMeetings());
+adminRouter.get('/meetings', async (_req, res) => {
+  res.json(await listAdminMeetings());
 });
 
 /**
@@ -55,61 +54,63 @@ function meetingInput(body) {
   };
 }
 
-const meetingById = db.prepare('select * from meetings where id = ?');
-
-const readMeeting = (id) => {
-  const found = row(meetingById, id);
+async function readMeeting(id) {
+  const found = await row('select * from meetings where id = ?', id);
   if (!found) throw notFound('That meeting no longer exists.');
-  return { ...found, active: found.active === 1 };
-};
+  return { ...found, active: Number(found.active) === 1 };
+}
 
-adminRouter.post('/meetings', (req, res) => {
+adminRouter.post('/meetings', async (req, res) => {
   const input = meetingInput(req.body);
   const id = uuid();
-  db.prepare(
-    `insert into meetings
-       (id, meeting_code, meeting_name, description, active)
+  await run(
+    `insert into meetings (id, meeting_code, meeting_name, description, active)
      values (?, ?, ?, ?, ?)`,
-  ).run(id, input.meeting_code, input.meeting_name, input.description, input.active);
-  res.status(201).json(readMeeting(id));
+    id,
+    input.meeting_code,
+    input.meeting_name,
+    input.description,
+    input.active,
+  );
+  res.status(201).json(await readMeeting(id));
 });
 
-adminRouter.put('/meetings/:id', (req, res) => {
+adminRouter.put('/meetings/:id', async (req, res) => {
   const input = meetingInput(req.body);
-  const { changes } = db
-    .prepare(
-      `update meetings
-          set meeting_code = ?, meeting_name = ?, description = ?,
-              active = ?, updated_at = ?
-        where id = ?`,
-    )
-    .run(
-      input.meeting_code,
-      input.meeting_name,
-      input.description,
-      input.active,
-      nowIso(),
-      req.params.id,
-    );
+  const { changes } = await run(
+    `update meetings
+        set meeting_code = ?, meeting_name = ?, description = ?,
+            active = ?, updated_at = ?
+      where id = ?`,
+    input.meeting_code,
+    input.meeting_name,
+    input.description,
+    input.active,
+    nowIso(),
+    req.params.id,
+  );
   if (changes === 0) throw notFound('That meeting no longer exists.');
-  res.json(readMeeting(req.params.id));
+  res.json(await readMeeting(req.params.id));
 });
 
 /** Activate / deactivate. A deactivated meeting's QR code stops resolving. */
-adminRouter.patch('/meetings/:id/active', (req, res) => {
-  const { changes } = db
-    .prepare('update meetings set active = ?, updated_at = ? where id = ?')
-    .run(req.body?.active ? 1 : 0, nowIso(), req.params.id);
+adminRouter.patch('/meetings/:id/active', async (req, res) => {
+  const { changes } = await run(
+    'update meetings set active = ?, updated_at = ? where id = ?',
+    req.body?.active ? 1 : 0,
+    nowIso(),
+    req.params.id,
+  );
   if (changes === 0) throw notFound('That meeting no longer exists.');
   res.status(204).end();
 });
 
-adminRouter.delete('/meetings/:id', (req, res) => {
+adminRouter.delete('/meetings/:id', async (req, res) => {
   // No "is it safe?" check here: `attendance` references meetings ON DELETE
-  // RESTRICT, so SQLite refuses a delete that would orphan check-ins and the
-  // refusal is translated into a sentence. The counts on the list view let the
-  // UI say so before the click; this is the guarantee behind it.
-  db.prepare('delete from meetings where id = ?').run(req.params.id);
+  // RESTRICT, so the database refuses a delete that would orphan check-ins and
+  // the refusal is translated into a sentence. The counts on the list view let
+  // the UI say so before the click; this is the guarantee behind it.
+  await run('delete from meetings where id = ?', req.params.id);
   res.status(204).end();
 });
 
@@ -117,8 +118,8 @@ adminRouter.delete('/meetings/:id', (req, res) => {
  * People
  * ------------------------------------------------------------------------ */
 
-adminRouter.get('/people', (req, res) => {
-  res.json(listAdminPeople(str(req.query.search)));
+adminRouter.get('/people', async (req, res) => {
+  res.json(await listAdminPeople(str(req.query.search)));
 });
 
 function personInput(body) {
@@ -128,45 +129,53 @@ function personInput(body) {
   return { person_number: number, name, active: body?.active === false ? 0 : 1 };
 }
 
-const personById = db.prepare('select * from people where id = ?');
-
-const readPerson = (id) => {
-  const found = row(personById, id);
+async function readPerson(id) {
+  const found = await row('select * from people where id = ?', id);
   if (!found) throw notFound('That person no longer exists.');
-  return { ...found, active: found.active === 1 };
-};
+  return { ...found, active: Number(found.active) === 1 };
+}
 
-adminRouter.post('/people', (req, res) => {
+adminRouter.post('/people', async (req, res) => {
   const input = personInput(req.body);
   const id = uuid();
-  db.prepare(
+  await run(
     'insert into people (id, person_number, name, active) values (?, ?, ?, ?)',
-  ).run(id, input.person_number, input.name, input.active);
-  res.status(201).json(readPerson(id));
+    id,
+    input.person_number,
+    input.name,
+    input.active,
+  );
+  res.status(201).json(await readPerson(id));
 });
 
-adminRouter.put('/people/:id', (req, res) => {
+adminRouter.put('/people/:id', async (req, res) => {
   const input = personInput(req.body);
-  const { changes } = db
-    .prepare(
-      `update people set person_number = ?, name = ?, active = ?, updated_at = ?
-        where id = ?`,
-    )
-    .run(input.person_number, input.name, input.active, nowIso(), req.params.id);
+  const { changes } = await run(
+    `update people set person_number = ?, name = ?, active = ?, updated_at = ?
+      where id = ?`,
+    input.person_number,
+    input.name,
+    input.active,
+    nowIso(),
+    req.params.id,
+  );
   if (changes === 0) throw notFound('That person no longer exists.');
-  res.json(readPerson(req.params.id));
+  res.json(await readPerson(req.params.id));
 });
 
-adminRouter.patch('/people/:id/active', (req, res) => {
-  const { changes } = db
-    .prepare('update people set active = ?, updated_at = ? where id = ?')
-    .run(req.body?.active ? 1 : 0, nowIso(), req.params.id);
+adminRouter.patch('/people/:id/active', async (req, res) => {
+  const { changes } = await run(
+    'update people set active = ?, updated_at = ? where id = ?',
+    req.body?.active ? 1 : 0,
+    nowIso(),
+    req.params.id,
+  );
   if (changes === 0) throw notFound('That person no longer exists.');
   res.status(204).end();
 });
 
-adminRouter.delete('/people/:id', (req, res) => {
-  db.prepare('delete from people where id = ?').run(req.params.id);
+adminRouter.delete('/people/:id', async (req, res) => {
+  await run('delete from people where id = ?', req.params.id);
   res.status(204).end();
 });
 
@@ -174,27 +183,31 @@ adminRouter.delete('/people/:id', (req, res) => {
  * Participant assignment
  * ------------------------------------------------------------------------ */
 
-const participantIds = db.prepare(
-  'select person_id from meeting_participants where meeting_id = ?',
-);
+const participantIds = (meetingId) =>
+  rows('select person_id from meeting_participants where meeting_id = ?', meetingId);
 
-adminRouter.get('/meetings/:id/participants', (req, res) => {
-  res.json(rows(participantIds, req.params.id).map((r) => r.person_id));
+adminRouter.get('/meetings/:id/participants', async (req, res) => {
+  res.json((await participantIds(req.params.id)).map((r) => r.person_id));
 });
 
-adminRouter.post('/meetings/:id/participants', (req, res) => {
+adminRouter.post('/meetings/:id/participants', async (req, res) => {
   const personId = str(req.body?.personId);
   if (!personId) throw badRequest();
-  db.prepare(
+  await run(
     'insert into meeting_participants (id, meeting_id, person_id) values (?, ?, ?)',
-  ).run(uuid(), req.params.id, personId);
+    uuid(),
+    req.params.id,
+    personId,
+  );
   res.status(204).end();
 });
 
-adminRouter.delete('/meetings/:id/participants/:personId', (req, res) => {
-  db.prepare(
+adminRouter.delete('/meetings/:id/participants/:personId', async (req, res) => {
+  await run(
     'delete from meeting_participants where meeting_id = ? and person_id = ?',
-  ).run(req.params.id, req.params.personId);
+    req.params.id,
+    req.params.personId,
+  );
   res.status(204).end();
 });
 
@@ -204,38 +217,34 @@ adminRouter.delete('/meetings/:id/participants/:personId', (req, res) => {
  * Writes only the difference, so ticking one extra person does not delete and
  * re-insert the other five — which would churn `created_at` and, more
  * importantly, briefly leave a meeting with no eligible participants while the
- * attendance form is live. The whole diff runs in one transaction, so a
- * half-applied roster is not a state anyone can observe.
+ * attendance form is live. The whole diff goes as one batched transaction, so
+ * a half-applied roster is not a state anyone can observe.
  */
-adminRouter.put('/meetings/:id/participants', (req, res) => {
+adminRouter.put('/meetings/:id/participants', async (req, res) => {
   const meetingId = req.params.id;
   const wanted = Array.isArray(req.body?.personIds) ? req.body.personIds : null;
   if (!wanted) throw badRequest();
 
-  const current = rows(participantIds, meetingId).map((r) => r.person_id);
+  const current = (await participantIds(meetingId)).map((r) => r.person_id);
   const next = new Set(wanted);
   const existing = new Set(current);
 
-  const toAdd = wanted.filter((id) => !existing.has(id));
-  const toRemove = current.filter((id) => !next.has(id));
+  const statements = [
+    ...wanted
+      .filter((id) => !existing.has(id))
+      .map((personId) => ({
+        sql: 'insert into meeting_participants (id, meeting_id, person_id) values (?, ?, ?)',
+        args: [uuid(), meetingId, personId],
+      })),
+    ...current
+      .filter((id) => !next.has(id))
+      .map((personId) => ({
+        sql: 'delete from meeting_participants where meeting_id = ? and person_id = ?',
+        args: [meetingId, personId],
+      })),
+  ];
 
-  const insert = db.prepare(
-    'insert into meeting_participants (id, meeting_id, person_id) values (?, ?, ?)',
-  );
-  const remove = db.prepare(
-    'delete from meeting_participants where meeting_id = ? and person_id = ?',
-  );
-
-  db.exec('begin');
-  try {
-    for (const personId of toAdd) insert.run(uuid(), meetingId, personId);
-    for (const personId of toRemove) remove.run(meetingId, personId);
-    db.exec('commit');
-  } catch (error) {
-    db.exec('rollback');
-    throw error;
-  }
-
+  if (statements.length > 0) await batch(statements);
   res.status(204).end();
 });
 
@@ -243,17 +252,17 @@ adminRouter.put('/meetings/:id/participants', (req, res) => {
  * Dashboard and the attendance log
  * ------------------------------------------------------------------------ */
 
-adminRouter.get('/dashboard/stats', (_req, res) => {
-  res.json(dashboardStats());
+adminRouter.get('/dashboard/stats', async (_req, res) => {
+  res.json(await dashboardStats());
 });
 
-adminRouter.get('/dashboard/summaries', (_req, res) => {
-  res.json(meetingSummaries());
+adminRouter.get('/dashboard/summaries', async (_req, res) => {
+  res.json(await meetingSummaries());
 });
 
-adminRouter.get('/attendance', (req, res) => {
+adminRouter.get('/attendance', async (req, res) => {
   res.json(
-    attendanceRows({
+    await attendanceRows({
       meetingCode: str(req.query.meetingCode),
       date: str(req.query.date),
       from: str(req.query.from),
@@ -275,29 +284,31 @@ const rangeFilters = (query) => ({
   meetingCode: str(query.meetingCode),
 });
 
-adminRouter.get('/reports/daily-breakdown', (req, res) => {
-  res.json(reportDailyBreakdown(str(req.query.date), str(req.query.meetingCode)));
+adminRouter.get('/reports/daily-breakdown', async (req, res) => {
+  res.json(
+    await reportDailyBreakdown(str(req.query.date), str(req.query.meetingCode)),
+  );
 });
 
-adminRouter.get('/reports/meeting-people', (req, res) => {
+adminRouter.get('/reports/meeting-people', async (req, res) => {
   const meetingCode = str(req.query.meetingCode);
   if (!meetingCode) throw badRequest('Pick a meeting first.');
   res.json(
-    reportMeetingPeople(meetingCode, {
+    await reportMeetingPeople(meetingCode, {
       from: str(req.query.from),
       to: str(req.query.to),
     }),
   );
 });
 
-adminRouter.get('/reports/daily-trend', (req, res) => {
-  res.json(reportDailyTrend(rangeFilters(req.query)));
+adminRouter.get('/reports/daily-trend', async (req, res) => {
+  res.json(await reportDailyTrend(rangeFilters(req.query)));
 });
 
-adminRouter.get('/reports/meeting-summary', (req, res) => {
-  res.json(reportMeetingSummary(rangeFilters(req.query)));
+adminRouter.get('/reports/meeting-summary', async (req, res) => {
+  res.json(await reportMeetingSummary(rangeFilters(req.query)));
 });
 
-adminRouter.get('/reports/participant-summary', (req, res) => {
-  res.json(reportParticipantSummary(rangeFilters(req.query)));
+adminRouter.get('/reports/participant-summary', async (req, res) => {
+  res.json(await reportParticipantSummary(rangeFilters(req.query)));
 });

@@ -8,12 +8,14 @@
     "server": "node --env-file-if-exists=.env.local server/index.js",
     "build": "tsc -b && vite build",
     "start": "npm run build && npm run server",
+    "db:push": "node --env-file-if-exists=.env.local scripts/db-push.mjs",
     "admin": "node --env-file-if-exists=.env.local server/admin-cli.js",
     "lint": "oxlint",
     "preview": "vite preview",
     "db:verify": "node scripts/verify-db.mjs"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "qrcode.react": "^4.2.0",

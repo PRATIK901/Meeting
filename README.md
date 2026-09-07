@@ -5,11 +5,11 @@ Each meeting has a stable public URL; scanning its QR code opens a form that
 lists **only** the people eligible for that meeting, and a submission is written
 to an append-only attendance log that can be exported to Excel.
 
-Stack: **React 19 + TypeScript + Vite + Tailwind CSS v4 + Express + SQLite**.
+Stack: **React 19 + TypeScript + Vite + Tailwind CSS v4 + Express + SQLite (libSQL)**.
 
-Everything is local. The data lives in one SQLite file on the machine that
-runs the app; there is no hosted database, no API key, and no account to sign
-up for. Unplug the network and the whole system still works.
+The data lives in SQLite either way — as a file on your machine for local use,
+or as a hosted [Turso](https://turso.tech) database for the Vercel deployment.
+Same schema, same queries, same code; only `TURSO_DATABASE_URL` differs.
 
 ---
 
@@ -17,30 +17,25 @@ up for. Unplug the network and the whole system still works.
 
 ### Prerequisites
 
-Node.js 22.5+ (`node --version`). Nothing else — no Docker, no database server,
-no cloud account. The database is [`node:sqlite`](https://nodejs.org/api/sqlite.html),
-which ships with Node itself, so `npm install` pulls no native module and needs
-no compiler.
+Node.js 22.5+ (`node --version`). Nothing else for local use — no Docker, no
+database server. Deploying additionally needs a free [Turso](https://turso.tech)
+database and a Vercel account (see [section 5](#5-deployment)).
 
-### Install and run
+### Install and run locally
 
 ```bash
 npm install
-npm start            # builds the frontend, then serves everything on :3000
+npm run db:push      # create the database file, schema and trial data
+npm start            # build the frontend, then serve everything on :3000
 ```
 
-That is the whole setup. On first boot the server creates its database file,
-applies the schema, loads the trial meetings and roster from the brief, and
-prints the credentials for a first administrator:
+With no `TURSO_DATABASE_URL` set, the data is a local SQLite file at
+`data/attendance.db` — no account, no network, no configuration.
 
-```
-  Created the first administrator: admin@local / changeme
-  Change it with `npm run admin -- <email> <password>` before anyone else
-  can reach this machine.
-
-  Attendance server on http://localhost:3000
-  Data file: …/data/attendance.db
-```
+`db:push` seeds the trial meetings and roster from the brief, and creates a
+first administrator if `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set. There is
+deliberately **no default password**: with none set it creates no account and
+tells you to run `npm run admin`.
 
 Open <http://localhost:3000>. Phones on the same Wi-Fi reach it at the
 machine's LAN address (`http://192.168.x.x:3000`) — which is what the QR codes
@@ -60,14 +55,18 @@ npm run dev -- --host    # also reachable from a phone on the same Wi-Fi
 
 ### Configuration
 
-There is none to do. `.env.example` documents four optional variables — where
-to put the database file, which port to listen on, and the first
-administrator's credentials — and copying it to `.env.local` is only worth
-doing if you want to change one of them.
+Nothing is required locally. `.env.example` documents what exists — the Turso
+credentials, the office timezone, the first administrator, and the port. Copy
+it to `.env.local` if you need any of them; both `npm run server` and
+`npm run admin` read that file.
+
+The one that matters in production is **`ATTENDANCE_TIMEZONE`**. It decides
+which calendar day a check-in is filed under. Unset it is UTC, which is only
+correct near Greenwich.
 
 ### Administrators
 
-Accounts are rows in the local `admin_users` table, created from the terminal:
+Accounts are rows in `admin_users`, created from the terminal:
 
 ```bash
 npm run admin -- you@company.com a-real-password   # create, or reset a password
@@ -75,34 +74,32 @@ npm run admin -- --list                            # who can sign in
 npm run admin -- --remove someone@company.com      # revoke access
 ```
 
+These act on whichever database the environment points at, so setting the Turso
+variables first is how you create the deployment's administrator.
+
 ### Verify the database
 
 ```bash
 npm run db:verify
 ```
 
-Twenty-six assertions against a throwaway database in your temp folder: the
-constraints, the attendance rule, the delete guards, every report, and the
-session lifecycle. It touches neither your real data nor the network, and takes
-about a second.
+Twenty-nine assertions against a throwaway database in your temp folder: the
+constraints, the attendance rule, the delete guards, every report, the session
+lifecycle and the timezone handling. It touches neither your real data nor the
+network, and takes about a second.
 
 ### All scripts
 
 ```bash
-npm start         # build + serve everything on :3000 (what you run in the office)
+npm start         # build + serve everything on :3000
 npm run server    # the API + database only
 npm run dev       # the UI with hot reload, :5173
 npm run build     # typecheck + production build into dist/
+npm run db:push   # apply schema + seed to the target database
 npm run admin     # manage administrator accounts
 npm run lint      # oxlint
 npm run db:verify # the assertion suite
 ```
-
-### Backups
-
-The database is a single file (`data/attendance.db`, or wherever `DATA_DIR`
-points). Copy it. Restoring is copying it back with the server stopped. It is
-excluded from git, because it is the real attendance record.
 
 ---
 
@@ -162,7 +159,7 @@ meetings                         people
             person_id       → people(id)    ON DELETE RESTRICT
             person_number   text   ┐ snapshots, stamped by the server
             person_name     text   ┘
-            attendance_date text   'YYYY-MM-DD', the server's local day
+            attendance_date text   'YYYY-MM-DD', in ATTENDANCE_TIMEZONE
             attended_at     text   ISO-8601 UTC
             created_at      text
             UNIQUE (meeting_id, person_id, attendance_date)
@@ -583,31 +580,69 @@ client changes nothing about what it will hand over.
 
 ## 5. Deployment
 
-"Deployment" is one command on the machine that will hold the data:
+Deployed on Vercel, with the database on Turso. The two halves:
+
+| Piece | Where it runs |
+| --- | --- |
+| `dist/` (the React app) | Vercel's CDN, as static files |
+| `api/index.js` (the Express app) | a Vercel serverless function, handling `/api/*` |
+| the database | Turso, over the network |
+
+`vercel.json` routes `/api/*` to the function and everything else to
+`index.html` — the second rule is what makes a scanned QR code work, since
+`/attendance/A` is a client-side route with no file behind it.
+
+### Why the database had to move
+
+The local build wrote to a SQLite file next to the server. A serverless
+function cannot: its filesystem is read-only, and containers are recycled
+between requests, so a check-in written during one request would be gone by the
+next. Turso is SQLite over the network, which is why the port changed so
+little — the schema and nearly every query are unchanged; they are just awaited
+now.
+
+### First-time setup
 
 ```bash
-npm install
-npm start        # build, then serve the app and the API on :3000
+# 1. Create the database (https://turso.tech, or the CLI)
+turso db create meeting-attendance
+turso db show meeting-attendance --url        # -> TURSO_DATABASE_URL
+turso db tokens create meeting-attendance     # -> TURSO_AUTH_TOKEN
+
+# 2. Apply the schema and seed it, from your machine
+TURSO_DATABASE_URL=… TURSO_AUTH_TOKEN=… ADMIN_EMAIL=you@example.com   ADMIN_PASSWORD=… npm run db:push
 ```
 
-`npm start` serves the built frontend from `dist/` and the API from the same
-process, on the same origin — so the QR URLs, the session cookie and the API
-all agree without any proxy configuration. Unknown paths fall back to
-`index.html`, because the QR URLs are client-side routes and a phone opening
-`/attendance/A` must get the app rather than a 404.
+Then set these in **Vercel -> Project Settings -> Environment Variables**:
 
-The server binds `0.0.0.0`, so phones on the office Wi-Fi reach it at the
-machine's LAN address. Find it with `ipconfig` (Windows) or `ip addr` (Linux),
-and print the QR codes with `VITE_PUBLIC_SITE_URL=http://192.168.x.x:3000` set
-at build time so the codes encode an address phones can actually reach.
+| Variable | Value |
+| --- | --- |
+| `TURSO_DATABASE_URL` | `libsql://…turso.io` |
+| `TURSO_AUTH_TOKEN` | the token from above |
+| `ATTENDANCE_TIMEZONE` | the office's zone, e.g. `Asia/Kolkata` |
 
-To keep it running across reboots, register it with whatever the machine
-already uses — a Windows scheduled task at logon, a systemd unit, or `pm2`. It
-is one long-lived Node process with a file beside it; nothing else to
-orchestrate.
+`ATTENDANCE_TIMEZONE` matters more than it looks. Serverless functions run in
+UTC, so without it an evening check-in in India is recorded against the
+following day, and the "attendance today" figures disagree with the room.
 
-A static host is no longer an option, and that is the trade: the app now has a
-server because it now has a database, and both are yours.
+Redeploy after setting them — environment variables are read at runtime, but a
+running deployment does not pick up new ones.
+
+### What deployment costs you
+
+The app no longer works offline, and the attendance data now lives on someone
+else's servers rather than in a file you hold. That is the trade Vercel
+requires; the local path below still works unchanged if you want it back.
+
+### Running it locally
+
+Unchanged. With no `TURSO_DATABASE_URL` set, everything falls back to
+`data/attendance.db`:
+
+```bash
+npm run db:push    # first time only
+npm start          # build + serve on :3000
+```
 
 ---
 
@@ -615,23 +650,36 @@ server because it now has a database, and both are yours.
 
 ### Manage administrators
 
-The first one is created for you on an empty database — `admin@local` /
-`changeme`, printed at startup. Change it immediately:
+`npm run db:push` creates the first one from `ADMIN_EMAIL` / `ADMIN_PASSWORD`.
+There is no default password — an account with a known password on a database
+reachable from the internet is a different proposition from one on an office
+machine, so it refuses rather than guessing.
 
 ```bash
 npm run admin -- you@company.com a-real-password   # create, or reset a password
 npm run admin -- --list                            # who can sign in
-npm run admin -- --remove admin@local              # revoke access
+npm run admin -- --remove someone@company.com      # revoke access
 ```
 
-Removing an account signs that person out of every browser at once. Run these
-on the machine that holds the database; there is no remote administration.
+Removing an account signs that person out of every browser at once, since
+sessions cascade with it. These act on whichever database the environment
+points at — set the Turso variables to manage the deployment's accounts:
+
+```bash
+TURSO_DATABASE_URL=… TURSO_AUTH_TOKEN=… npm run admin -- --list
+```
 
 ### Back up the data
 
-Stop the server, copy `data/attendance.db` (plus the `-wal` and `-shm` files
-beside it if present), start it again. That file is the entire system of
-record. Restoring is copying it back.
+For the deployment, the data is in Turso:
+
+```bash
+turso db shell meeting-attendance .dump > backup-$(date +%F).sql
+```
+
+Locally it is a file: stop the server and copy `data/attendance.db` (plus the
+`-wal` and `-shm` files beside it). Either way, back it up on a schedule —
+nothing does it for you.
 
 ### Create a meeting
 

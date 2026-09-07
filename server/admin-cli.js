@@ -1,4 +1,4 @@
-import { db } from './db.js';
+import { isRemote, row, rows, run } from './db.js';
 import { createAdmin, hashPassword } from './auth.js';
 
 /**
@@ -8,10 +8,13 @@ import { createAdmin, hashPassword } from './auth.js';
  *   npm run admin -- --list               who can sign in
  *   npm run admin -- --remove <email>     revoke access
  *
- * There is no hosted dashboard any more, so this is where accounts come from.
+ * Acts on whichever database the environment points at — the local file by
+ * default, or the hosted one when `TURSO_DATABASE_URL` is set, which is how
+ * you create the deployment's first administrator.
+ *
  * Removing an account drops its sessions with it (`on delete cascade`), which
- * signs that person out of every browser immediately rather than whenever their
- * token happens to expire.
+ * signs that person out of every browser immediately rather than whenever
+ * their token happens to expire.
  */
 
 const args = process.argv.slice(2);
@@ -25,8 +28,10 @@ function usage() {
   );
 }
 
+console.log(`  (${isRemote ? 'hosted database' : 'local database'})`);
+
 if (args[0] === '--list') {
-  const admins = db.prepare('select email, created_at from admin_users order by email').all();
+  const admins = await rows('select email, created_at from admin_users order by email');
   if (admins.length === 0) console.log('No administrators yet.');
   for (const admin of admins) console.log(`${admin.email}\t${admin.created_at}`);
 } else if (args[0] === '--remove') {
@@ -35,7 +40,7 @@ if (args[0] === '--list') {
     usage();
     process.exit(1);
   }
-  const { changes } = db.prepare('delete from admin_users where email = ?').run(email);
+  const { changes } = await run('delete from admin_users where email = ?', email);
   console.log(changes > 0 ? `Removed ${email}.` : `No administrator named ${email}.`);
 } else if (args.length === 2) {
   const email = args[0].trim().toLowerCase();
@@ -45,20 +50,23 @@ if (args[0] === '--list') {
     process.exit(1);
   }
 
-  const existing = db.prepare('select id from admin_users where email = ?').get(email);
+  const existing = await row('select id from admin_users where email = ?', email);
   if (existing) {
-    db.prepare('update admin_users set password_hash = ? where id = ?').run(
+    // Old sessions stay valid on purpose: a password reset by the same person
+    // should not sign them out of the tab they are typing it in.
+    await run(
+      'update admin_users set password_hash = ? where id = ?',
       hashPassword(password),
       existing.id,
     );
-    // Old sessions stay valid on purpose: a password reset by the same person
-    // should not sign them out of the tab they are typing it in.
     console.log(`Reset the password for ${email}.`);
   } else {
-    createAdmin(email, password);
+    await createAdmin(email, password);
     console.log(`Created ${email}.`);
   }
 } else {
   usage();
   process.exit(args.length === 0 ? 0 : 1);
 }
+
+process.exit(0);

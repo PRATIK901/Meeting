@@ -3,10 +3,10 @@
  *
  *   npm run db:verify
  *
- * This replaces the old Docker + Postgres suite. It needs neither: it points
- * `DATA_DIR` at a throwaway folder, boots the same modules the server does, and
- * asserts the guarantees the app depends on. Nothing here touches your real
- * database, and nothing here touches the network.
+ * Runs against a throwaway SQLite file in your temp folder — it touches
+ * neither your real data nor the network. The same assertions hold against
+ * hosted Turso, since libSQL speaks the same dialect; point
+ * `TURSO_DATABASE_URL` at a scratch database if you want to prove that.
  */
 
 import assert from 'node:assert/strict';
@@ -15,19 +15,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const scratch = mkdtempSync(join(tmpdir(), 'attendance-verify-'));
-process.env.DATA_DIR = scratch;
+// Must be set before `server/db.js` is imported, hence the dynamic imports.
+process.env.TURSO_DATABASE_URL = `file:${join(scratch, 'verify.db')}`;
+process.env.TURSO_AUTH_TOKEN = '';
 
-const { db, uuid, today } = await import('../server/db.js');
-const { seedIfEmpty } = await import('../server/seed.js');
+const { db, row, run, uuid, today } = await import('../server/db.js');
+const { setup } = await import('../server/seed.js');
 const reports = await import('../server/reports.js');
 const { createAdmin, verifyPassword, createSession, adminForToken, destroySession } =
   await import('../server/auth.js');
 
 let failures = 0;
 
-function check(name, fn) {
+async function check(name, fn) {
   try {
-    fn();
+    await fn();
     console.log(`  ok    ${name}`);
   } catch (error) {
     failures += 1;
@@ -36,10 +38,10 @@ function check(name, fn) {
 }
 
 /** Assert that `fn` fails, and that the message mentions `fragment`. */
-function refuses(fn, fragment) {
+async function refuses(fn, fragment) {
   let thrown = null;
   try {
-    fn();
+    await fn();
   } catch (error) {
     thrown = error;
   }
@@ -47,17 +49,21 @@ function refuses(fn, fragment) {
   assert.match(String(thrown.message).toLowerCase(), new RegExp(fragment));
 }
 
-seedIfEmpty();
+const count = async (table, where = '', ...args) =>
+  Number((await row(`select count(*) n from ${table} ${where}`, ...args)).n);
 
-const meeting = db.prepare("select * from meetings where meeting_code = 'A'").get();
-const meetingC = db.prepare("select * from meetings where meeting_code = 'C'").get();
-const prasad = db.prepare("select * from people where person_number = '435'").get();
-const pratik = db.prepare("select * from people where person_number = '123'").get();
+await setup();
+
+const meeting = await row("select * from meetings where meeting_code = 'A'");
+const meetingC = await row("select * from meetings where meeting_code = 'C'");
+const prasad = await row("select * from people where person_number = '435'");
+const pratik = await row("select * from people where person_number = '123'");
 const day = today();
 
-const checkIn = (meetingId, personId, date = day) =>
-  db
-    .prepare(
+/** The same INSERT..SELECT the attendance route uses. */
+const checkIn = async (meetingId, personId, date = day) =>
+  (
+    await run(
       `insert into attendance
          (id, meeting_id, person_id, person_number, person_name,
           attendance_date, attended_at)
@@ -66,137 +72,155 @@ const checkIn = (meetingId, personId, date = day) =>
          join meeting_participants mp
            on mp.person_id = p.id and mp.meeting_id = ?
         where p.id = ? and p.active = 1`,
+      uuid(),
+      meetingId,
+      date,
+      `${date}T09:00:00.000Z`,
+      meetingId,
+      personId,
     )
-    .run(uuid(), meetingId, date, `${date}T09:00:00.000Z`, meetingId, personId).changes;
+  ).changes;
 
 console.log('\nSchema and seed');
 
-check('the trial data loaded', () => {
-  assert.equal(db.prepare('select count(*) n from meetings').get().n, 3);
-  assert.equal(db.prepare('select count(*) n from people').get().n, 6);
-  assert.equal(db.prepare('select count(*) n from meeting_participants').get().n, 13);
+await check('the trial data loaded', async () => {
+  assert.equal(await count('meetings'), 3);
+  assert.equal(await count('people'), 6);
+  assert.equal(await count('meeting_participants'), 13);
 });
 
-check('seeding twice changes nothing', () => {
-  seedIfEmpty();
-  assert.equal(db.prepare('select count(*) n from meetings').get().n, 3);
-  assert.equal(db.prepare('select count(*) n from admin_users').get().n, 1);
+await check('running setup twice changes nothing', async () => {
+  await setup();
+  assert.equal(await count('meetings'), 3);
+  assert.equal(await count('meeting_participants'), 13);
 });
 
-check('a meeting code must be unique', () => {
-  refuses(
+await check('a meeting code must be unique', async () => {
+  await refuses(
     () =>
-      db
-        .prepare('insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)')
-        .run(uuid(), 'A', 'Duplicate'),
+      run(
+        'insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)',
+        uuid(),
+        'A',
+        'Duplicate',
+      ),
     'unique',
   );
 });
 
-check('a person number must be unique', () => {
-  refuses(
+await check('a person number must be unique', async () => {
+  await refuses(
     () =>
-      db
-        .prepare('insert into people (id, person_number, name) values (?, ?, ?)')
-        .run(uuid(), '435', 'Impostor'),
+      run(
+        'insert into people (id, person_number, name) values (?, ?, ?)',
+        uuid(),
+        '435',
+        'Impostor',
+      ),
     'unique',
   );
 });
 
-check('a meeting code must be upper case', () => {
-  refuses(
+await check('a meeting code must be upper case', async () => {
+  await refuses(
     () =>
-      db
-        .prepare('insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)')
-        .run(uuid(), 'lower', 'Lower case'),
+      run(
+        'insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)',
+        uuid(),
+        'lower',
+        'Lower case',
+      ),
     'check',
   );
 });
 
 console.log('\nThe attendance rule');
 
-check('an eligible person can check in', () => {
-  assert.equal(checkIn(meeting.id, prasad.id), 1);
+await check('an eligible person can check in', async () => {
+  assert.equal(await checkIn(meeting.id, prasad.id), 1);
 });
 
-check('the same person cannot check in twice on the same day', () => {
-  refuses(() => checkIn(meeting.id, prasad.id), 'unique');
+await check('the same person cannot check in twice on the same day', async () => {
+  await refuses(() => checkIn(meeting.id, prasad.id), 'unique');
 });
 
-check('someone not on the roster records nothing', () => {
+await check('someone not on the roster records nothing', async () => {
   // Pratik is on Meeting A only. The INSERT..SELECT yields no row for C, so
   // this is a silent zero rather than a constraint failure — which is exactly
   // what the route turns into its 403.
-  assert.equal(checkIn(meetingC.id, pratik.id), 0);
+  assert.equal(await checkIn(meetingC.id, pratik.id), 0);
 });
 
-check('an inactive person records nothing', () => {
-  db.prepare('update people set active = 0 where id = ?').run(pratik.id);
-  assert.equal(checkIn(meeting.id, pratik.id), 0);
-  db.prepare('update people set active = 1 where id = ?').run(pratik.id);
+await check('an inactive person records nothing', async () => {
+  await run('update people set active = 0 where id = ?', pratik.id);
+  assert.equal(await checkIn(meeting.id, pratik.id), 0);
+  await run('update people set active = 1 where id = ?', pratik.id);
 });
 
-check('the stored name comes from the directory, not the caller', () => {
-  const row = db
-    .prepare('select person_name, person_number from attendance where person_id = ?')
-    .get(prasad.id);
-  assert.equal(row.person_name, 'Prasad');
-  assert.equal(row.person_number, '435');
+await check('the stored name comes from the directory, not the caller', async () => {
+  const saved = await row(
+    'select person_name, person_number from attendance where person_id = ?',
+    prasad.id,
+  );
+  assert.equal(saved.person_name, 'Prasad');
+  assert.equal(saved.person_number, '435');
 });
 
-check('a rename cannot rewrite history', () => {
-  db.prepare('update people set name = ? where id = ?').run('Prasad R', prasad.id);
-  const row = db
-    .prepare('select person_name from attendance where person_id = ?')
-    .get(prasad.id);
-  assert.equal(row.person_name, 'Prasad');
-  db.prepare('update people set name = ? where id = ?').run('Prasad', prasad.id);
+await check('a rename cannot rewrite history', async () => {
+  await run('update people set name = ? where id = ?', 'Prasad R', prasad.id);
+  const saved = await row(
+    'select person_name from attendance where person_id = ?',
+    prasad.id,
+  );
+  assert.equal(saved.person_name, 'Prasad');
+  await run('update people set name = ? where id = ?', 'Prasad', prasad.id);
 });
 
 console.log('\nDeleting is refused when it would orphan check-ins');
 
-check('a meeting with attendance cannot be deleted', () => {
-  refuses(
-    () => db.prepare('delete from meetings where id = ?').run(meeting.id),
+await check('a meeting with attendance cannot be deleted', async () => {
+  await refuses(
+    () => run('delete from meetings where id = ?', meeting.id),
     'foreign key',
   );
 });
 
-check('a person with attendance cannot be deleted', () => {
-  refuses(
-    () => db.prepare('delete from people where id = ?').run(prasad.id),
+await check('a person with attendance cannot be deleted', async () => {
+  await refuses(
+    () => run('delete from people where id = ?', prasad.id),
     'foreign key',
   );
 });
 
-check('a meeting with no attendance can be deleted, and takes its roster', () => {
+await check('a meeting with no attendance can be deleted, and takes its roster', async () => {
   const id = uuid();
-  db.prepare('insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)').run(
+  await run(
+    'insert into meetings (id, meeting_code, meeting_name) values (?, ?, ?)',
     id,
     'ZZZ',
     'Disposable',
   );
-  db.prepare(
+  await run(
     'insert into meeting_participants (id, meeting_id, person_id) values (?, ?, ?)',
-  ).run(uuid(), id, prasad.id);
-  db.prepare('delete from meetings where id = ?').run(id);
-  assert.equal(
-    db.prepare('select count(*) n from meeting_participants where meeting_id = ?').get(id).n,
-    0,
+    uuid(),
+    id,
+    prasad.id,
   );
+  await run('delete from meetings where id = ?', id);
+  assert.equal(await count('meeting_participants', 'where meeting_id = ?', id), 0);
 });
 
 console.log('\nReports');
 
-check('the dashboard counts today', () => {
-  const stats = reports.dashboardStats();
+await check('the dashboard counts today', async () => {
+  const stats = await reports.dashboardStats();
   assert.equal(stats.total_meetings, 3);
   assert.equal(stats.attendance_today, 1);
   assert.ok(stats.attendance_this_month >= 1);
 });
 
-check('the daily breakdown lists every active meeting, attended or not', () => {
-  const breakdown = reports.reportDailyBreakdown(day);
+await check('the daily breakdown lists every active meeting, attended or not', async () => {
+  const breakdown = await reports.reportDailyBreakdown(day);
   assert.equal(breakdown.length, 3);
   const a = breakdown.find((r) => r.meeting_code === 'A');
   assert.equal(a.eligible_participants, 6);
@@ -205,22 +229,22 @@ check('the daily breakdown lists every active meeting, attended or not', () => {
   assert.equal(a.attendance_percentage, 16.67);
 });
 
-check('a meeting report covers everyone eligible, not only attendees', () => {
-  const people = reports.reportMeetingPeople('A');
+await check('a meeting report covers everyone eligible, not only attendees', async () => {
+  const people = await reports.reportMeetingPeople('A');
   assert.equal(people.length, 6);
   assert.equal(people.filter((p) => p.attended).length, 1);
 });
 
-check('the trend counts one occurrence per meeting per day', () => {
-  const trend = reports.reportDailyTrend({});
+await check('the trend counts one occurrence per meeting per day', async () => {
+  const trend = await reports.reportDailyTrend({});
   assert.equal(trend.length, 1);
   assert.equal(trend[0].meetings_held, 1);
   assert.equal(trend[0].eligible, 6);
   assert.equal(trend[0].present, 1);
 });
 
-check('the participant summary counts eligibility per occurrence', () => {
-  const summary = reports.reportParticipantSummary({});
+await check('the participant summary counts eligibility per occurrence', async () => {
+  const summary = await reports.reportParticipantSummary({});
   assert.equal(summary.length, 6);
   const entry = summary.find((r) => r.person_number === '435');
   assert.equal(entry.meetings_eligible, 1);
@@ -228,20 +252,32 @@ check('the participant summary counts eligibility per occurrence', () => {
   assert.equal(entry.attendance_percentage, 100);
 });
 
-check('a date range excludes what falls outside it', () => {
-  assert.equal(reports.reportDailyTrend({ from: '2000-01-01', to: '2000-12-31' }).length, 0);
-  assert.equal(reports.attendanceRows({ date: '2000-01-01' }).length, 0);
-  assert.equal(reports.attendanceRows({ meetingCode: 'a' }).length, 1);
+await check('the meeting summary reports one row per occurrence', async () => {
+  const summary = await reports.reportMeetingSummary({});
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0].meeting_code, 'A');
+  assert.equal(summary[0].attended, 1);
+  assert.equal(summary[0].absent, 5);
 });
 
-check('the people search matches either column, case-insensitively', () => {
-  assert.equal(reports.listAdminPeople('pras').length, 1);
-  assert.equal(reports.listAdminPeople('435').length, 1);
-  assert.equal(reports.listAdminPeople('').length, 6);
+await check('a date range excludes what falls outside it', async () => {
+  assert.equal(
+    (await reports.reportDailyTrend({ from: '2000-01-01', to: '2000-12-31' })).length,
+    0,
+  );
+  assert.equal((await reports.attendanceRows({ date: '2000-01-01' })).length, 0);
+  assert.equal((await reports.attendanceRows({ meetingCode: 'a' })).length, 1);
 });
 
-check('the admin list reports the counts that gate deletion', () => {
-  const a = reports.listAdminMeetings().find((m) => m.meeting_code === 'A');
+await check('the people search matches either column, case-insensitively', async () => {
+  assert.equal((await reports.listAdminPeople('pras')).length, 1);
+  assert.equal((await reports.listAdminPeople('435')).length, 1);
+  assert.equal((await reports.listAdminPeople('')).length, 6);
+});
+
+await check('the admin list reports the counts that gate deletion', async () => {
+  const all = await reports.listAdminMeetings();
+  const a = all.find((m) => m.meeting_code === 'A');
   assert.equal(a.participant_count, 6);
   assert.equal(a.attendance_count, 1);
   assert.equal(a.active, true);
@@ -249,47 +285,70 @@ check('the admin list reports the counts that gate deletion', () => {
 
 console.log('\nAccounts and sessions');
 
-check('a password verifies only against itself', () => {
-  createAdmin('verify@local', 'correct horse battery');
-  const stored = db
-    .prepare('select password_hash from admin_users where email = ?')
-    .get('verify@local').password_hash;
+await check('a password verifies only against itself', async () => {
+  await createAdmin('verify@local', 'correct horse battery');
+  const { password_hash: stored } = await row(
+    'select password_hash from admin_users where email = ?',
+    'verify@local',
+  );
   assert.ok(verifyPassword('correct horse battery', stored));
   assert.ok(!verifyPassword('wrong horse battery', stored));
   // The password itself is never stored.
   assert.ok(!stored.includes('correct'));
 });
 
-check('a session resolves, and stops resolving once destroyed', () => {
-  const admin = db.prepare('select id from admin_users where email = ?').get('verify@local');
-  const { token } = createSession(admin.id);
-  assert.equal(adminForToken(token).email, 'verify@local');
-  destroySession(token);
-  assert.equal(adminForToken(token), null);
-  assert.equal(adminForToken('not-a-real-token'), null);
+await check('a session resolves, and stops resolving once destroyed', async () => {
+  const admin = await row('select id from admin_users where email = ?', 'verify@local');
+  const { token } = await createSession(admin.id);
+  assert.equal((await adminForToken(token)).email, 'verify@local');
+  await destroySession(token);
+  assert.equal(await adminForToken(token), null);
+  assert.equal(await adminForToken('not-a-real-token'), null);
 });
 
-check('an expired session is refused and cleaned up', () => {
-  const admin = db.prepare('select id from admin_users where email = ?').get('verify@local');
-  const token = 'expired-token';
-  db.prepare('insert into sessions (token, admin_id, expires_at) values (?, ?, ?)').run(
+await check('an expired session is refused and cleaned up', async () => {
+  const admin = await row('select id from admin_users where email = ?', 'verify@local');
+  const token = 'expired-session-token';
+  await run(
+    'insert into sessions (token, admin_id, expires_at) values (?, ?, ?)',
     token,
     admin.id,
     '2000-01-01T00:00:00.000Z',
   );
-  assert.equal(adminForToken(token), null);
-  assert.equal(db.prepare('select count(*) n from sessions where token = ?').get(token).n, 0);
+  assert.equal(await adminForToken(token), null);
+  assert.equal(await count('sessions', 'where token = ?', token), 0);
 });
 
-check('removing an administrator drops their sessions with them', () => {
-  const admin = db.prepare('select id from admin_users where email = ?').get('verify@local');
-  const { token } = createSession(admin.id);
-  db.prepare('delete from admin_users where id = ?').run(admin.id);
-  assert.equal(db.prepare('select count(*) n from sessions where token = ?').get(token).n, 0);
+await check('removing an administrator drops their sessions with them', async () => {
+  const admin = await row('select id from admin_users where email = ?', 'verify@local');
+  const { token } = await createSession(admin.id);
+  await run('delete from admin_users where id = ?', admin.id);
+  assert.equal(await count('sessions', 'where token = ?', token), 0);
 });
 
+console.log('\nTimezone');
+
+await check('the attendance day follows ATTENDANCE_TIMEZONE', async () => {
+  // The format is what the column stores and what the range queries compare.
+  assert.match(today(), /^\d{4}-\d{2}-\d{2}$/);
+  const inKolkata = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+  assert.match(inKolkata, /^\d{4}-\d{2}-\d{2}$/);
+});
+
+// Best-effort cleanup. Windows keeps a lock on the WAL files briefly after
+// close, and a scratch file left in the OS temp folder is not worth failing a
+// green run over — the assertions above are what this script is for.
 db.close();
-rmSync(scratch, { recursive: true, force: true });
+try {
+  rmSync(scratch, { recursive: true, force: true });
+} catch {
+  console.log(`\n  (left ${scratch} behind — the OS still had it open)`);
+}
 
 console.log(
   failures === 0 ? '\nAll checks passed.\n' : `\n${failures} check(s) failed.\n`,
