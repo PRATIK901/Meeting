@@ -1,4 +1,3 @@
-import { createClient } from '@libsql/client';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -26,9 +25,28 @@ const localFile = `file:${join(here, '..', 'data', 'attendance.db')}`;
 export const dbUrl = process.env.TURSO_DATABASE_URL?.trim() || localFile;
 export const isRemote = dbUrl.startsWith('libsql:') || dbUrl.startsWith('https:');
 
-// libSQL opens a file but will not create the folder holding it, and on Vercel
-// there is no folder to create — so this runs only in local file mode.
+/**
+ * Which client to build — and this distinction is load-bearing.
+ *
+ * `@libsql/client`'s default entry point loads a *native* binding, one
+ * `.node` binary per platform. Installing on Windows fetches only the Windows
+ * one, so the bundle Vercel builds has no binary it can run on Linux and the
+ * function dies on import, before any handler or error middleware exists. The
+ * symptom is a 500 with an empty body, which looks like a crashed query and is
+ * not one.
+ *
+ * The `web` entry point has no native code at all — it talks to Turso over
+ * HTTP with `fetch`. That is the right client for a serverless function
+ * regardless, since there is no local file to open there. It cannot open a
+ * `file:` URL though, so local development keeps the native client.
+ */
+const { createClient } = isRemote
+  ? await import('@libsql/client/web')
+  : await import('@libsql/client');
+
 if (!isRemote) {
+  // libSQL opens a file but will not create the folder holding it. There is no
+  // folder to create on Vercel, hence only in local file mode.
   mkdirSync(dirname(dbUrl.replace(/^file:/, '')), { recursive: true });
 }
 
