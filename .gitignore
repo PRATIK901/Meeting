@@ -1,0 +1,40 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# The attendance database itself. This is the real data — back up the folder,
+# do not commit it. It holds admin password hashes, live session tokens, and
+# the personal data (names, person numbers) of everyone who has checked in.
+data/
+
+# Debugging artefacts that capture the running app, and therefore capture real
+# attendee names along with it.
+.playwright-mcp/
+*.png
+!public/*.png
