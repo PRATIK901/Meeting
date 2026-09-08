@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { batch, db, row, run, uuid } from './db.js';
+import { batch, db, isRemote, row, run, uuid } from './db.js';
 import { createAdmin } from './auth.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -19,8 +19,20 @@ const here = dirname(fileURLToPath(import.meta.url));
 /** Every statement in schema.sql is `if not exists`, so this is idempotent. */
 export async function migrate() {
   const sql = readFileSync(join(here, 'schema.sql'), 'utf8');
+
+  /**
+   * `pragma journal_mode = wal` is a statement about a *file* — it tells SQLite
+   * how to journal one on disk. Turso has no such file to configure: it manages
+   * its own storage and rejects the pragma outright with HTTP 400, which fails
+   * the whole script and leaves the hosted database without a schema.
+   *
+   * So the pragma is stripped when the target is remote and kept when it is the
+   * local file, where it is exactly the setting we want.
+   */
+  const portable = isRemote ? sql.replace(/^\s*pragma[^;]*;/gim, '') : sql;
+
   // libSQL executes one statement per call; `executeMultiple` takes the file.
-  await db.executeMultiple(sql);
+  await db.executeMultiple(portable);
 }
 
 const MEETINGS = [
